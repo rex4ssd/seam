@@ -1,0 +1,62 @@
+version: 1
+
+# Who you are — sent to ollama as scoring context
+profile: |
+  Solo developer, Python 5+ years, Rust beginner, React/TypeScript intermediate.
+  Mac Studio M1 32GB. Main projects: Lode (Tauri 2 desktop app, Rust+React),
+  Vein (Python CLI, decision lore archive). Available: ~4 weeks per side project.
+  Goals: improve Lode features, find reusable patterns, learn Rust idioms.
+  Also interested in high-quality macOS/iOS open source Swift apps and Tauri/Rust desktop tools.
+
+interests:
+  primary:
+    - tauri
+    - macos-app
+    - rust
+    - file-diff
+    - code-search
+    - desktop-app
+    - swift
+    - ios
+  secondary:
+    - python-cli
+    - developer-tools
+    - ai-tooling
+    - sqlite
+    - macos
+  avoid:
+    - kubernetes
+    - enterprise
+    - java
+    - android
+
+scoring:
+  target_relevance_weight: 0.6
+  solo_feasible_weight: 0.4
+  min_score: 60
+
+picks_per_day: 3
+
+github:
+  token: ""   # or export GITHUB_TOKEN=...
+  min_stars: 500
+  max_age_days: 180
+  queries:
+    # macOS / iOS — Swift（高星）
+    - "topic:macos language:swift stars:>2000"
+    - "topic:ios language:swift stars:>2000"
+    - "topic:macos-app language:swift stars:>1000"
+    - "topic:swift-package stars:>1000"
+    # Rust / Tauri — desktop
+    - "topic:tauri stars:>500"
+    - "topic:macos language:rust stars:>500"
+    - "topic:desktop-app language:rust stars:>300"
+    # Python tools (Rex's secondary interest)
+    - "topic:python-cli stars:>500"
+    - "topic:developer-tools language:python stars:>300"
+    - "topic:ai-tooling language:python stars:>200"
+
+model:
+  base_url: http://localhost:11434
+  score_model: deepseek-r1:14b
+  fallback: heuristic
