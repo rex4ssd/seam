@@ -5,13 +5,72 @@ from pathlib import Path
 
 import click
 
-from ..core.config import load_config
+from ..core.config import SeamConfig, load_config
 from ..core.models import Pick
 from ..core.store import append_picks, seen_ids
 from ..score.heuristic import score_heuristic
 from ..score.ollama import ollama_available, score_ollama
 from ..sources.github import search_github
 
+
+# ── programmatic API (used by seam_harvest_entry) ─────────────────────────────
+
+def run_pipeline(
+    cfg: SeamConfig,
+    n_picks: int | None = None,
+    engine: str = "auto",
+    cooldown: bool = True,
+    save: bool = True,
+    verbose: bool = False,
+) -> list[Pick]:
+    """
+    Execute search → score → filter → pick.
+    Returns list of Pick (may be empty).
+    Does NOT print anything — callers handle output.
+    """
+    n = n_picks or cfg.picks_per_day
+    min_score = cfg.scoring.get("min_score", 60)
+    gh = cfg.github
+
+    candidates = search_github(
+        queries=gh["queries"],
+        token=cfg.github_token,
+        min_stars=gh.get("min_stars", 200),
+        max_age_days=gh.get("max_age_days", 90),
+        per_query=30,
+    )
+    if not candidates:
+        return []
+
+    if engine == "auto":
+        use_ollama = ollama_available(cfg.ollama_base_url)
+    else:
+        use_ollama = engine == "ollama"
+
+    scored = (
+        score_ollama(candidates, cfg, verbose=verbose)
+        if use_ollama
+        else score_heuristic(candidates, cfg)
+    )
+
+    scored = [s for s in scored if s.score >= min_score]
+    if cooldown:
+        cold = seen_ids()
+        scored = [s for s in scored if s.candidate.id not in cold]
+
+    if not scored:
+        return []
+
+    today = date.today().isoformat()
+    picks = [Pick(rank=i + 1, scored=s, date=today) for i, s in enumerate(scored[:n])]
+
+    if save:
+        append_picks(picks)
+
+    return picks
+
+
+# ── Click command (thin wrapper around run_pipeline) ──────────────────────────
 
 @click.command("run")
 @click.option("--picks", "n_picks", default=None, type=int,
@@ -38,59 +97,24 @@ def cmd_run(
 ) -> None:
     """Full pipeline: search → score → pick → print (and save)."""
     cfg = load_config(None if profile_path is None else Path(profile_path))
-    n = n_picks or cfg.picks_per_day
-    min_score = cfg.scoring.get("min_score", 60)
-    gh = cfg.github
 
-    # ── 1. Search ────────────────────────────────────────────────────────
     if not pipe:
         click.echo("[seam] searching GitHub …", err=True)
-    candidates = search_github(
-        queries=gh["queries"],
-        token=cfg.github_token,
-        min_stars=gh.get("min_stars", 200),
-        max_age_days=gh.get("max_age_days", 90),
-        per_query=30,
+
+    picks = run_pipeline(
+        cfg,
+        n_picks=n_picks,
+        engine=engine,
+        cooldown=not no_cooldown,
+        save=not no_save,
+        verbose=verbose,
     )
-    if not candidates:
-        click.echo("[seam] no candidates found", err=True)
-        sys.exit(0)
-    if verbose:
-        click.echo(f"[seam] {len(candidates)} candidates after search", err=True)
 
-    # ── 2. Score ─────────────────────────────────────────────────────────
-    if engine == "auto":
-        use_ollama = ollama_available(cfg.ollama_base_url)
-        if not use_ollama and verbose:
-            click.echo(f"[seam] ollama not available, using heuristic", err=True)
-    else:
-        use_ollama = engine == "ollama"
-
-    if use_ollama:
-        if not pipe:
-            click.echo(f"[seam] scoring with {cfg.score_model} …", err=True)
-        scored = score_ollama(candidates, cfg, verbose=verbose)
-    else:
-        scored = score_heuristic(candidates, cfg)
-
-    # ── 3. Filter + cooldown ─────────────────────────────────────────────
-    scored = [s for s in scored if s.score >= min_score]
-    if not no_cooldown:
-        cold = seen_ids()
-        scored = [s for s in scored if s.candidate.id not in cold]
-
-    if not scored:
-        click.echo("[seam] no picks after filters", err=True)
+    if not picks:
+        click.echo("[seam] no picks found", err=True)
         sys.exit(0)
 
-    # ── 4. Pick top-N ────────────────────────────────────────────────────
     today = date.today().isoformat()
-    picks = [
-        Pick(rank=i + 1, scored=s, date=today)
-        for i, s in enumerate(scored[:n])
-    ]
-
-    # ── 5. Output ────────────────────────────────────────────────────────
     if pipe:
         for p in picks:
             print(p.scored.candidate.id)
@@ -102,9 +126,3 @@ def cmd_run(
             click.echo(f"    {c.url}")
             click.echo(f"    Why: {p.scored.reason}")
         click.echo("─" * 50)
-
-    # ── 6. Save ──────────────────────────────────────────────────────────
-    if not no_save:
-        append_picks(picks)
-        if verbose:
-            click.echo(f"[seam] saved {len(picks)} picks to picks.jsonl", err=True)

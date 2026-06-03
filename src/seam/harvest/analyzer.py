@@ -14,17 +14,15 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 from ..core.config import SeamConfig
 from ..core.models import Candidate, RepoSignals, StrengthReport
+from ..core.ollama_utils import call_ollama, parse_json_response
 
 # ── constants ──────────────────────────────────────────────────────────────────
 
@@ -112,7 +110,7 @@ def analyze(
     prompt = _build_prompt(signals, repo_dir, cand, cfg)
 
     try:
-        parsed = _call_ollama(
+        parsed = _call_ollama_and_validate(
             base_url=cfg.ollama_base_url,
             model=cfg.score_model,
             prompt=prompt,
@@ -251,39 +249,14 @@ def _build_file_excerpts(sample_files: list[str], repo_dir: Path) -> str:
 
 # ── ollama call ────────────────────────────────────────────────────────────────
 
-def _call_ollama(
+def _call_ollama_and_validate(
     base_url: str,
     model: str,
     prompt: str,
     timeout: int,
 ) -> dict[str, Any]:
-    """POST to ollama /api/generate; raise on failure or bad response."""
-    url = base_url.rstrip("/") + "/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
-    with httpx.Client(timeout=timeout) as client:
-        resp = client.post(url, json=payload)
-        resp.raise_for_status()
-    raw = resp.json().get("response", "")
-    return _parse_json_response(raw)
-
-
-def _parse_json_response(text: str) -> dict[str, Any]:
-    """
-    Extract a JSON object from an ollama response.
-    Handles:
-    - <think>…</think> reasoning traces (deepseek-r1)
-    - ```json … ``` markdown fences
-    - Leading/trailing prose
-    """
-    # strip deepseek-r1 thinking blocks
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    # strip markdown code fences
-    text = re.sub(r"```(?:json)?\s*", "", text).replace("```", "").strip()
-    # find first complete {...}
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise ValueError(f"no JSON object found in response (first 200 chars): {text[:200]!r}")
-    parsed = json.loads(m.group())
+    """Call ollama, parse JSON, validate 5-dim structure."""
+    parsed = call_ollama(base_url, model, prompt, timeout=timeout)
     _validate_response(parsed)
     return parsed
 

@@ -1,12 +1,9 @@
 from __future__ import annotations
-import json
-import re
 import sys
-
-import httpx
 
 from ..core.config import SeamConfig
 from ..core.models import Candidate, ScoredCandidate
+from ..core.ollama_utils import call_ollama, ollama_available, parse_json_response
 
 _TRUNCATE = 1500   # P-S05: truncate README/description before sending to ollama
 _TIMEOUT = 120     # P-S05: ollama timeout
@@ -33,16 +30,6 @@ Respond ONLY with a JSON object, no markdown, no explanation:
 {{"target_relevance": <int>, "solo_feasible": <int>, "reason": "<one sentence>"}}
 """
 
-
-def _parse_json_response(text: str) -> dict:
-    """Extract JSON from ollama response (may contain <think>…</think> prefix)."""
-    # strip <think>…</think> blocks (deepseek-r1 reasoning traces)
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    # find first {...}
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise ValueError(f"No JSON found in response: {text[:200]!r}")
-    return json.loads(m.group())
 
 
 def score_ollama(
@@ -72,7 +59,7 @@ def score_ollama(
         )
 
         try:
-            parsed = _call_ollama(cfg.ollama_base_url, cfg.score_model, prompt)
+            parsed = call_ollama(cfg.ollama_base_url, cfg.score_model, prompt, timeout=_TIMEOUT)
             rel = int(parsed.get("target_relevance", 0))
             sol = int(parsed.get("solo_feasible", 0))
             final = int(rel * w_rel + sol * w_sol)
@@ -101,21 +88,5 @@ def score_ollama(
     return results
 
 
-def _call_ollama(base_url: str, model: str, prompt: str) -> dict:
-    url = base_url.rstrip("/") + "/api/generate"
-    payload = {"model": model, "prompt": prompt, "stream": False}
-    with httpx.Client(timeout=_TIMEOUT) as client:
-        resp = client.post(url, json=payload)
-        resp.raise_for_status()
-    data = resp.json()
-    raw = data.get("response", "")
-    return _parse_json_response(raw)
-
-
-def ollama_available(base_url: str) -> bool:
-    try:
-        with httpx.Client(timeout=5) as client:
-            r = client.get(base_url.rstrip("/") + "/api/tags")
-            return r.status_code == 200
-    except Exception:
-        return False
+# ollama_available re-exported for backward compatibility
+__all__ = ["score_ollama", "ollama_available", "parse_json_response"]

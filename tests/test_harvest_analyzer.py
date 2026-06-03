@@ -21,11 +21,11 @@ import yaml
 
 from seam.core.config import load_config, DEFAULT_PROFILE, DEFAULT_HARVEST
 from seam.core.models import Candidate, RepoSignals, StrengthReport
+from seam.core.ollama_utils import parse_json_response as _parse_json_response
 from seam.harvest.analyzer import (
     analyze,
     heuristic_score,
     _build_prompt,
-    _parse_json_response,
     _validate_response,
     _heuristic_dimensions,
     _score_tech,
@@ -493,7 +493,7 @@ class TestAnalyze:
     def test_ollama_path_engine_field(self, tmp_path):
         cfg = _make_cfg(tmp_path)
         mock_resp = self._mock_httpx_response(_valid_ollama_json())
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -508,7 +508,7 @@ class TestAnalyze:
         cfg = _make_cfg(tmp_path)
         ollama_json = _valid_ollama_json(tech=88, style=72, stab=91, val=80, on=75)
         mock_resp = self._mock_httpx_response(ollama_json)
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -526,7 +526,7 @@ class TestAnalyze:
         # all dims >= 70 → all tags
         ollama_json = _valid_ollama_json(tech=75, style=71, stab=80, val=72, on=74)
         mock_resp = self._mock_httpx_response(ollama_json)
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -543,7 +543,7 @@ class TestAnalyze:
         # onboarding=50 < threshold=70 → no easy_onboarding tag
         ollama_json = _valid_ollama_json(tech=80, style=80, stab=80, val=80, on=50)
         mock_resp = self._mock_httpx_response(ollama_json)
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -556,7 +556,7 @@ class TestAnalyze:
 
     def test_ollama_connection_error_falls_back(self, tmp_path, capsys):
         cfg = _make_cfg(tmp_path)
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -573,7 +573,7 @@ class TestAnalyze:
     def test_bad_json_response_falls_back(self, tmp_path, capsys):
         cfg = _make_cfg(tmp_path)
         mock_resp = self._mock_httpx_response("I cannot evaluate this.")
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
@@ -586,7 +586,7 @@ class TestAnalyze:
 
     def test_analyze_returns_strength_report(self, tmp_path):
         cfg = _make_cfg(tmp_path)
-        with patch("seam.harvest.analyzer.httpx.Client") as mock_client_cls:
+        with patch("seam.core.ollama_utils.httpx.Client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.__enter__ = MagicMock(return_value=mock_client)
             mock_client.__exit__ = MagicMock(return_value=False)
