@@ -19,3 +19,10 @@ seam = "seam.cli:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: tests that require internet access (deselect with -m 'not network')",
+]
+addopts = "-m 'not network'"

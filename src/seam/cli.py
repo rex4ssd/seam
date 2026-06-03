@@ -6,6 +6,7 @@ from .commands.score import cmd_score
 from .commands.pick import cmd_pick
 from .commands.run import cmd_run
 from .commands.log_cmd import cmd_log
+from .commands.harvest import cmd_harvest
 
 
 @click.group()
@@ -26,3 +27,4 @@ cli.add_command(cmd_score)
 cli.add_command(cmd_pick)
 cli.add_command(cmd_run)
 cli.add_command(cmd_log)
+cli.add_command(cmd_harvest)

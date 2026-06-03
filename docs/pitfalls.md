@@ -153,6 +153,65 @@ log 保留 30 天，`seam gc` 順便清 log。
 
 ---
 
+## Phase 3 harvest 特有的雷（預測）
+
+### P-H01 — 2T 磁碟滿 → clone 寫一半損壞
+
+**觸發：** 永久保留策略下 2T 越來越滿；clone 大 repo 中途空間不足。
+**Fix：**
+- clone 前 `shutil.disk_usage(target_dir)` 檢查剩餘空間 < `min_free_gb`（預設 20G）就停止整個 harvest，印明確警告。
+- 用 GitHub API 的 repo `size`（KB）預估，超過 `size_cap_mb` 直接跳過、在 `_index.jsonl` 記 `skipped: size`。
+- clone 到 temp 目錄成功後才 `mv` 進正式 layout（避免半成品占位）。
+
+### P-H02 — `git clone` 夜間 hang 卡死整批
+
+**觸發：** 網路抖動、超大 repo、LFS 拉取。一個卡住 → 整晚 harvest 停擺。
+**Fix：**
+- subprocess 帶 `timeout=clone.timeout_sec`（預設 300s），超時 kill + 記錄 + 續跑下一個。
+- `--single-branch --depth 1` 降低資料量。
+
+```python
+try:
+    subprocess.run(["git", "clone", "--depth", "1", "--single-branch", url, tmp],
+                   timeout=cfg.timeout_sec, check=True,
+                   env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"})
+except subprocess.TimeoutExpired:
+    log.warning("clone timeout, skip %s", repo); continue
+```
+
+### P-H03 — 重複 harvest 同一 repo → 重 clone 浪費
+
+**觸發：** 同一 repo 被再次 pick；或重跑當天 harvest。
+**Fix：** 落地路徑已存在 → 不重 clone，改 `git fetch --depth 1 && git reset --hard origin/HEAD` 更新；`_index.jsonl` 用 `(repo, commit)` 去重，commit 沒變就跳過化驗（承 I-004 冪等）。
+
+### P-H04 — Git LFS / 大 binary 拖垮 shallow clone
+
+**觸發：** repo 用 LFS 存模型/資料集，depth-1 仍會 smudge 拉 GB 級檔案。
+**Fix：** `GIT_LFS_SKIP_SMUDGE=1` 環境變數；化驗只看程式碼與設定檔，不需 LFS 內容。
+
+### P-H05 — ollama 化驗整個 repo → context 爆 / timeout
+
+**觸發：** 把整包 source 丟給 ollama 必爆 context window。
+**Fix：**
+- 只送：靜態 signal 摘要 + 截斷 README（`readme_truncate`，預設 1500）+ 取樣代表檔案（`sample_files`，預設 8，挑入口/設定/測試各一）。
+- 單次 ollama `timeout=ollama_timeout_sec`（預設 180s），超時 → heuristic fallback（純 signal 評分），印警告（承 P-V01）。
+
+### P-H06 — harvest 夜間炸了沒 log / 重觸 / 鎖沒放（無 cron，cowork schedule 觸發）
+
+**觸發：** harvest 比 search/score 久（含 clone）；cowork schedule 可能重觸或上次中途死掉。
+**Fix：**（orchestration = `seam_harvest_entry.py` 一次性 entry，非 cron，見 `harvest_architecture.md` §7）
+- entry 自身 logging（不靠 cron 重導向）；每階段寫 `harvest_history.csv`（running→pass/fail）。
+- lock file `.seam/harvest.lock`（含 pid），啟動檢查；stale lock（pid 不存在）自動清，防 cowork schedule 雙觸。
+- 中斷後重跑：`(repo, commit)` 已 finalized 跳過；只有 `running` 沒終局的非冪等階段（analyze/veinout）保守跳過，不重燒 ollama（語意參考 `schedule_entry.py` 的 in_progress）。
+- 補跑 / 重試：`--self-check` 模式掃前 24h fail 逐筆重試（參考 `run_self_check()`）。
+
+### P-H07 — 絕不執行 clone 下來的程式碼
+
+**觸發：** 為了測 validation 強度，誘惑去 build / 跑測試。
+**Fix：** 化驗**純靜態**。不 `cargo build`、不 `pytest`、不 `npm install`、不跑任何 repo 內 script（守 D-009 安全 trade-off）。validation 強度只由靜態跡象（CI config、test 檔數、coverage badge）推估。
+
+---
+
 ## Invariants（不可違反）
 
 ### I-001 — GITHUB_TOKEN 不可進 profile.yaml
