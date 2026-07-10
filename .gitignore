@@ -9,3 +9,7 @@ build/
 # Seam runtime data
 .seam/cache/
 .seam/picks.jsonl
+
+# 一次性本機工具/雜項（勿追蹤）
+pytest-cache-files-*/
+remove_git_lock.sh
