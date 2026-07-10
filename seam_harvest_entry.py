@@ -10,12 +10,19 @@ Usage:
   python seam_harvest_entry.py --self-check  # retry last 24h failures
   python seam_harvest_entry.py --dry-run     # show plan, no disk writes
 
+Override settings (all optional, profile.yaml values used as default):
+  --picks N          override picks_per_day
+  --max-repos N      override harvest.max_repos_per_night
+  --model NAME       override model.score_model  (e.g. llama3.2)
+  --size-cap MB      override harvest.clone.size_cap_mb
+
 Design: harvest_architecture.md §7
 Reliability pattern: runtime/history.py (catch-up + in-progress skip + self-check)
                      runtime/lock.py    (prevent double-trigger from cowork schedule)
 """
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from datetime import date
@@ -54,14 +61,53 @@ from seam.runtime.history import (
 _HIST = default_history_path()
 
 
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="seam_harvest_entry", add_help=False)
+    p.add_argument("--dry-run",    action="store_true")
+    p.add_argument("--self-check", action="store_true")
+    p.add_argument("--from-picks", action="store_true")
+    p.add_argument("--yes",        action="store_true",
+                   help="auto-confirm overwrite of updated repos (no prompt)")
+    # setting overrides
+    p.add_argument("--picks",     type=int,   default=None, metavar="N",
+                   help="override picks_per_day (default: profile.yaml value)")
+    p.add_argument("--max-repos", type=int,   default=None, metavar="N",
+                   help="override harvest.max_repos_per_night")
+    p.add_argument("--model",     type=str,   default=None, metavar="NAME",
+                   help="override model.score_model (e.g. llama3.2)")
+    p.add_argument("--size-cap",  type=int,   default=None, metavar="MB",
+                   help="override harvest.clone.size_cap_mb")
+    return p.parse_args(argv)
+
+
+def _apply_overrides(cfg, args: argparse.Namespace) -> None:
+    """Patch cfg._data in-place with any CLI overrides."""
+    if args.picks is not None:
+        cfg._data["picks_per_day"] = args.picks
+        log.info("override picks_per_day=%d", args.picks)
+    if args.max_repos is not None:
+        cfg._data.setdefault("harvest", {})["max_repos_per_night"] = args.max_repos
+        log.info("override max_repos_per_night=%d", args.max_repos)
+    if args.model is not None:
+        cfg._data.setdefault("model", {})["score_model"] = args.model
+        log.info("override score_model=%s", args.model)
+    if args.size_cap is not None:
+        cfg._data.setdefault("harvest", {}).setdefault("clone", {})["size_cap_mb"] = args.size_cap
+        log.info("override size_cap_mb=%d", args.size_cap)
+
+
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    dry_run    = "--dry-run"    in argv
-    self_check = "--self-check" in argv
+    args       = _parse_args(argv)
+    dry_run    = args.dry_run
+    self_check = args.self_check
+    from_picks = args.from_picks
+    auto_update = args.yes   # --yes → auto-confirm overwrite; else prompt
 
     cfg = load_config(find_profile())
+    _apply_overrides(cfg, args)
     harvest_cfg = cfg.harvest
 
     # ── validate target_dir ───────────────────────────────────────────────
@@ -75,6 +121,12 @@ def main(argv: list[str] | None = None) -> int:
 
     index_path = harvest_index_path(target_dir)
 
+    # ── clean up stale temp dirs from previous crashed runs ───────────────
+    if not dry_run:
+        removed = cloner.cleanup_stale_temps(target_dir)
+        if removed:
+            log.info("cleaned up %d stale temp dir(s)", removed)
+
     # ── --self-check path ─────────────────────────────────────────────────
     if self_check:
         return _run_self_check(cfg, target_dir, index_path, dry_run)
@@ -82,13 +134,16 @@ def main(argv: list[str] | None = None) -> int:
     # ── normal run (single-instance lock) ─────────────────────────────────
     try:
         with single_instance():
-            return _run_once(cfg, harvest_cfg, target_dir, index_path, dry_run)
+            return _run_once(cfg, harvest_cfg, target_dir, index_path, dry_run,
+                             from_picks=from_picks, auto_update=auto_update)
     except LockError as exc:
         log.warning("lock held — skipping: %s", exc)
         return 0   # not an error; another harvest is active
 
 
-def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path, dry_run: bool) -> int:
+def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path,
+              dry_run: bool, from_picks: bool = False,
+              auto_update: bool = True) -> int:
     """One full harvest cycle."""
     finalized, in_progress = load_done_keys(_HIST)
     sf = now_slot()
@@ -97,11 +152,17 @@ def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path, dry_run: boo
     log.info("harvest start  slot=%s  dry_run=%s", sf, dry_run)
 
     # ── get picks ─────────────────────────────────────────────────────────
-    try:
-        picks = run_pipeline(cfg, save=not dry_run)
-    except Exception as exc:
-        log.error("pick pipeline failed: %s", exc)
-        return 1
+    if from_picks:
+        # Read today's picks from picks.jsonl — skip GitHub search + scoring
+        log.info("reading picks from picks.jsonl (--from-picks)")
+        picks = _picks_from_log(cfg)
+    else:
+        log.info("running search + score pipeline (takes 2-5 min) ...")
+        try:
+            picks = run_pipeline(cfg, save=not dry_run)
+        except Exception as exc:
+            log.error("pick pipeline failed: %s", exc)
+            return 1
 
     if not picks:
         log.info("no picks today")
@@ -125,6 +186,7 @@ def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path, dry_run: boo
             cr = cloner.clone_repo(
                 slug, target_dir, harvest_cfg,
                 language=cand.language, stars=cand.stars,
+                auto_update=auto_update,
             )
             commit = cr.commit or "unknown"
         except Exception as exc:
@@ -171,6 +233,9 @@ def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path, dry_run: boo
         mark(_HIST, slug, commit, "report", "running", sf)
         try:
             report.write_report(rep, clone_path, index_path)
+            # CSV log — one row per repo
+            csv_path = target_dir / "harvest_log.csv"
+            report.append_csv_log(rep, csv_path)
             mark(_HIST, slug, commit, "report", "pass", sf)
             reports.append(rep)
             tag_str = ", ".join(rep.strength_tags) or "none"
@@ -199,6 +264,38 @@ def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path, dry_run: boo
         len(reports), len(picks),
     )
     return 0
+
+
+def _picks_from_log(cfg) -> list:
+    """Read today's (or recent) picks from picks.jsonl, reconstruct Pick objects."""
+    from seam.core.models import Candidate, ScoredCandidate, Pick
+    rows = load_picks(days=1)   # today only
+    if not rows:
+        rows = load_picks(days=3)  # fallback: last 3 days
+
+    picks = []
+    for row in rows[:cfg.picks_per_day]:
+        cand = Candidate(
+            source=row.get("source", "github"),
+            id=row["id"],
+            title=row.get("title", row["id"]),
+            description="",
+            stars=row.get("stars", 0),
+            url=row.get("url", f"https://github.com/{row['id']}"),
+            pushed_at="",
+            language=row.get("language", ""),
+            topics=[],
+        )
+        scored = ScoredCandidate(
+            candidate=cand,
+            score=row.get("score", 0),
+            reason=row.get("reason", ""),
+            dimensions=row.get("dimensions", {}),
+        )
+        picks.append(Pick(rank=row.get("rank", 1), scored=scored, date=row.get("date", "")))
+
+    log.info("loaded %d pick(s) from picks.jsonl", len(picks))
+    return picks
 
 
 def _run_self_check(cfg, target_dir: Path, index_path: Path, dry_run: bool) -> int:

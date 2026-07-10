@@ -42,6 +42,8 @@ class Pick:
             "title": c.title,
             "stars": c.stars,
             "url": c.url,
+            "language": c.language,
+            "topics": c.topics,
             "score": self.scored.score,
             "reason": self.scored.reason,
             "dimensions": self.scored.dimensions,

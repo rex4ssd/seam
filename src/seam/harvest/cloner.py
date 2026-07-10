@@ -37,6 +37,23 @@ _GIT_ENV = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0"
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def cleanup_stale_temps(target_root: Path) -> int:
+    """
+    Delete leftover seam_clone_* temp dirs from crashed runs.
+    Returns the number of dirs removed.
+    """
+    removed = 0
+    for lang_dir in target_root.iterdir():
+        if not lang_dir.is_dir():
+            continue
+        for d in lang_dir.iterdir():
+            if d.is_dir() and d.name.startswith("seam_clone_"):
+                shutil.rmtree(d, ignore_errors=True)
+                _warn("cleanup", f"removed stale temp dir: {d}")
+                removed += 1
+    return removed
+
+
 def clone_repo(
     slug: str,
     target_root: Path,
@@ -46,6 +63,7 @@ def clone_repo(
     stars: int = 0,
     dry_run: bool = False,
     verbose: bool = False,
+    auto_update: bool = True,   # False = prompt before overwriting existing repo
 ) -> CloneResult:
     """
     Clone (or update) owner/repo into target_root/<lang>/<owner>__<repo>/.
@@ -59,7 +77,8 @@ def clone_repo(
     # ── 1. already exists? ────────────────────────────────────────────────
     if final_dir.exists():
         return _handle_existing(slug, final_dir, clone_url, cfg,
-                                lang_folder, stars, dry_run, verbose)
+                                lang_folder, stars, dry_run, verbose,
+                                auto_update=auto_update)
 
     # ── 2. free space guard (P-H01) ──────────────────────────────────────
     free_gb = _free_gb(target_root)
@@ -111,6 +130,7 @@ def clone_repos_batch(
     *,
     dry_run: bool = False,
     verbose: bool = False,
+    auto_update: bool = True,
 ) -> list[CloneResult]:
     """
     Clone up to cfg.max_repos_per_night repos, stopping early if disk is low.
@@ -127,7 +147,8 @@ def clone_repos_batch(
             break
         result = clone_repo(slug, target_root, cfg,
                             language=language, stars=stars,
-                            dry_run=dry_run, verbose=verbose)
+                            dry_run=dry_run, verbose=verbose,
+                            auto_update=auto_update)
         results.append(result)
     return results
 
@@ -143,6 +164,7 @@ def _handle_existing(
     stars: int,
     dry_run: bool,
     verbose: bool,
+    auto_update: bool = True,
 ) -> CloneResult:
     """Repo dir exists: check remote HEAD; skip if same, fetch+reset if different."""
     meta = read_meta(final_dir)
@@ -167,6 +189,21 @@ def _handle_existing(
         _info(slug, f"[dry-run] would update {stored_commit[:8]} → {remote_commit[:8]}")
         return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
                            language=lang_folder, skipped=True, skipped_reason="dry_run")
+
+    # ── new commit detected — ask or auto ────────────────────────────────
+    _info(slug, f"new commit detected: {stored_commit[:8]} → {remote_commit[:8]}")
+    if not auto_update:
+        if sys.stdin.isatty():
+            ans = input(f"  overwrite {slug}? [y/N] ").strip().lower()
+            if ans != "y":
+                _info(slug, "skipped by user")
+                return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
+                                   language=lang_folder, skipped=True, skipped_reason="user_skip")
+        else:
+            # non-interactive (schedule) — skip and log
+            _warn(slug, "non-interactive: skipping update (use --yes to auto-update)")
+            return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
+                               language=lang_folder, skipped=True, skipped_reason="non_interactive_skip")
 
     # fetch + reset (P-H03)
     ok, new_commit = _do_fetch_reset(slug, final_dir, cfg, verbose)

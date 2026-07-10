@@ -9,12 +9,19 @@ Public API:
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
+from datetime import date
 from pathlib import Path
 
 from ..core.models import StrengthReport
 from .layout import strength_report_path
+
+_CSV_FIELDS = [
+    "date", "slug", "stars", "language", "languages",
+    "strength_tags", "summary", "url", "clone_path", "commit",
+]
 
 # ── dimension display order ────────────────────────────────────────────────────
 
@@ -28,6 +35,48 @@ _DIMS = [
 
 
 # ── public API ─────────────────────────────────────────────────────────────────
+
+def append_csv_log(rep: StrengthReport, csv_path: Path) -> None:
+    """
+    Append one row to the harvest CSV log (created with header if new).
+    Idempotency: skips if (slug, commit) already present.
+    """
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    commit_short = rep.commit[:8] if rep.commit else ""
+    key = (rep.candidate_id, commit_short)
+
+    if csv_path.exists():
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if (row.get("slug"), row.get("commit")) == key:
+                    return  # already logged
+
+    lang_breakdown = "; ".join(
+        f"{ext}:{pct}%" for ext, pct in list(rep.languages.items())[:5]
+    ) if rep.languages else rep.language
+
+    row = {
+        "date":          rep.analyzed_at[:10] if rep.analyzed_at else date.today().isoformat(),
+        "slug":          rep.candidate_id,
+        "stars":         rep.stars,
+        "language":      rep.language,
+        "languages":     lang_breakdown,
+        "strength_tags": " ".join(rep.strength_tags),
+        "summary":       (rep.summary or "").replace("\n", " ").strip(),
+        "url":           f"https://github.com/{rep.candidate_id}",
+        "clone_path":    rep.clone_path,
+        "commit":        rep.commit[:8] if rep.commit else "",
+    }
+
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+        f.flush()
+        os.fsync(f.fileno())
+
 
 def write_report(rep: StrengthReport, repo_dir: Path, index_path: Path) -> Path:
     """

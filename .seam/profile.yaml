@@ -60,3 +60,30 @@ model:
   base_url: http://localhost:11434
   score_model: deepseek-r1:14b
   fallback: heuristic
+
+harvest:
+  target_dir: /Volumes/2T_260130/py_in_2T/github_open_project
+  max_repos_per_night: 3
+  retention: permanent
+  clone:
+    depth: 1
+    single_branch: true
+    lfs: skip
+    size_cap_mb: 500
+    timeout_sec: 300
+    min_free_gb: 20
+  analyze:
+    tag_threshold: 70
+    readme_truncate: 1500
+    sample_files: 8
+    ollama_timeout_sec: 180
+  lang_map:
+    Rust: rust
+    Python: python
+    Swift: swift
+    Go: go
+    TypeScript: typescript
+    JavaScript: javascript
+    "C++": cpp
+    C: c
+    default: _unknown
