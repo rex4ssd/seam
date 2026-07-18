@@ -30,7 +30,12 @@ import yaml
 
 from seam.core.models import StrengthReport
 from seam.harvest.report import write_report, _render_markdown, _append_index
-from seam.harvest.veinout import to_vein_lines, write_vein_watchlist, _vein_line
+from seam.harvest.veinout import (
+    WatchlistError,
+    to_vein_lines,
+    write_vein_watchlist,
+    _vein_line,
+)
 
 
 # ── fixtures ───────────────────────────────────────────────────────────────────
@@ -373,3 +378,116 @@ class TestWriteVeinWatchlist:
         write_vein_watchlist([], vein_dir, "2026-06-03")
         data = yaml.safe_load((vein_dir / "watchlist.yaml").read_text())
         assert data["seam-2026-06-03"]["repos"] == []
+
+    def test_unparseable_watchlist_not_overwritten(self, tmp_path):
+        """Corrupt existing YAML → raise, never clobber the file."""
+        vein_dir = tmp_path / ".vein"
+        vein_dir.mkdir()
+        corrupt = "key: [unclosed\n  - broken: : :\n"
+        wl = vein_dir / "watchlist.yaml"
+        wl.write_text(corrupt)
+        with pytest.raises(WatchlistError):
+            write_vein_watchlist([_make_report("a/b")], vein_dir, "2026-06-03")
+        assert wl.read_text() == corrupt   # untouched
+
+    def test_non_mapping_watchlist_not_overwritten(self, tmp_path):
+        """Valid YAML that isn't a mapping (e.g. a list) → raise, keep file."""
+        vein_dir = tmp_path / ".vein"
+        vein_dir.mkdir()
+        original = "- just\n- a\n- list\n"
+        wl = vein_dir / "watchlist.yaml"
+        wl.write_text(original)
+        with pytest.raises(WatchlistError):
+            write_vein_watchlist([_make_report("a/b")], vein_dir, "2026-06-03")
+        assert wl.read_text() == original
+
+    def test_empty_watchlist_file_ok(self, tmp_path):
+        """Empty file (safe_load → None) is fine — treated as fresh."""
+        vein_dir = tmp_path / ".vein"
+        vein_dir.mkdir()
+        (vein_dir / "watchlist.yaml").write_text("")
+        write_vein_watchlist([_make_report("a/b")], vein_dir, "2026-06-03")
+        data = yaml.safe_load((vein_dir / "watchlist.yaml").read_text())
+        assert data["seam-2026-06-03"]["repos"] == ["a/b"]
+
+    def test_no_tmp_leftover_after_write(self, tmp_path):
+        vein_dir = tmp_path / ".vein"
+        write_vein_watchlist([_make_report("a/b")], vein_dir, "2026-06-03")
+        leftovers = [p for p in vein_dir.iterdir() if ".tmp." in p.name]
+        assert leftovers == []
+
+
+# ── core.store.atomic_write_text ───────────────────────────────────────────────
+
+class TestAtomicWriteText:
+    def test_writes_content(self, tmp_path):
+        from seam.core.store import atomic_write_text
+        p = tmp_path / "out.txt"
+        atomic_write_text(p, "hello")
+        assert p.read_text() == "hello"
+
+    def test_overwrites_atomically(self, tmp_path):
+        from seam.core.store import atomic_write_text
+        p = tmp_path / "out.txt"
+        p.write_text("old")
+        atomic_write_text(p, "new")
+        assert p.read_text() == "new"
+
+    def test_creates_parent_dirs(self, tmp_path):
+        from seam.core.store import atomic_write_text
+        p = tmp_path / "a" / "b" / "out.txt"
+        atomic_write_text(p, "x")
+        assert p.read_text() == "x"
+
+    def test_failed_write_keeps_original(self, tmp_path, monkeypatch):
+        """Crash between temp-write and replace must keep the old file."""
+        import seam.core.store as store_mod
+        p = tmp_path / "out.txt"
+        p.write_text("precious")
+
+        def boom(src, dst):
+            raise OSError("simulated crash")
+
+        monkeypatch.setattr(store_mod.os, "replace", boom)
+        with pytest.raises(OSError):
+            store_mod.atomic_write_text(p, "half-written")
+        assert p.read_text() == "precious"
+        leftovers = [q for q in tmp_path.iterdir() if ".tmp." in q.name]
+        assert leftovers == []   # temp cleaned up
+
+
+# ── core.config — token env-only ───────────────────────────────────────────────
+
+class TestGithubTokenEnvOnly:
+    def _cfg_with_profile_token(self, token: str):
+        from seam.core.config import SeamConfig, DEFAULT_PROFILE
+        import copy
+        data = copy.deepcopy(DEFAULT_PROFILE)
+        data["github"]["token"] = token
+        return SeamConfig(data)
+
+    def test_profile_token_ignored(self, monkeypatch, capsys):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        cfg = self._cfg_with_profile_token("ghp_plaintext_secret")
+        assert cfg.github_token == ""          # NOT the profile value
+        err = capsys.readouterr().err
+        assert "IGNORED" in err                # user is warned
+
+    def test_env_token_used(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_from_env")
+        cfg = self._cfg_with_profile_token("ghp_plaintext_secret")
+        assert cfg.github_token == "ghp_from_env"
+
+    def test_warning_emitted_once(self, monkeypatch, capsys):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        cfg = self._cfg_with_profile_token("ghp_x")
+        cfg.github_token
+        cfg.github_token
+        err = capsys.readouterr().err
+        assert err.count("IGNORED") == 1
+
+    def test_no_warning_when_profile_token_empty(self, monkeypatch, capsys):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        cfg = self._cfg_with_profile_token("")
+        assert cfg.github_token == ""
+        assert "IGNORED" not in capsys.readouterr().err

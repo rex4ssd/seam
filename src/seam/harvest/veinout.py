@@ -17,6 +17,12 @@ from pathlib import Path
 import yaml
 
 from ..core.models import StrengthReport
+from ..core.store import atomic_write_text
+
+
+class WatchlistError(RuntimeError):
+    """Raised when the existing watchlist.yaml cannot be parsed — we refuse
+    to overwrite it (the file may contain collections from other tools)."""
 
 
 # ── public API ─────────────────────────────────────────────────────────────────
@@ -53,15 +59,27 @@ def write_vein_watchlist(
     wl_path = vein_dir / "watchlist.yaml"
     vein_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load existing watchlist (may not exist yet)
+    # Load existing watchlist (may not exist yet).
+    # A file that exists but cannot be parsed as a YAML mapping is NOT
+    # silently replaced — that would wipe every other collection in it.
     existing: dict = {}
     if wl_path.exists():
         try:
-            data = yaml.safe_load(wl_path.read_text(encoding="utf-8")) or {}
-            if isinstance(data, dict):
-                existing = data
-        except Exception:
-            pass
+            data = yaml.safe_load(wl_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise WatchlistError(
+                f"cannot parse existing watchlist ({wl_path}): {exc} — "
+                "refusing to overwrite; fix or move the file and retry"
+            ) from exc
+        if data is None:
+            existing = {}
+        elif isinstance(data, dict):
+            existing = data
+        else:
+            raise WatchlistError(
+                f"existing watchlist is not a YAML mapping ({wl_path}) — "
+                "refusing to overwrite; fix or move the file and retry"
+            )
 
     collection_key = f"seam-{day}"
     existing[collection_key] = {
@@ -69,9 +87,11 @@ def write_vein_watchlist(
         "compare": True,
     }
 
-    wl_path.write_text(
+    # temp + fsync + atomic replace: a crash mid-write never truncates
+    # or corrupts the shared watchlist file.
+    atomic_write_text(
+        wl_path,
         yaml.dump(existing, default_flow_style=False, allow_unicode=True),
-        encoding="utf-8",
     )
     return wl_path
 

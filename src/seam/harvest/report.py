@@ -16,6 +16,7 @@ from datetime import date
 from pathlib import Path
 
 from ..core.models import StrengthReport
+from ..core.store import atomic_write_text
 from .layout import strength_report_path
 
 _CSV_FIELDS = [
@@ -85,7 +86,7 @@ def write_report(rep: StrengthReport, repo_dir: Path, index_path: Path) -> Path:
     Returns the path to STRENGTH.md.
     """
     md_path = strength_report_path(repo_dir)
-    md_path.write_text(_render_markdown(rep), encoding="utf-8")
+    atomic_write_text(md_path, _render_markdown(rep))
 
     _append_index(rep, index_path)
 

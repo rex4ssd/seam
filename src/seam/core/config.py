@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -136,6 +137,7 @@ DEFAULT_PROFILE: dict[str, Any] = {
 class SeamConfig:
     def __init__(self, data: dict[str, Any]):
         self._data = data
+        self._warned_profile_token = False
 
     # ── top-level accessors ──────────────────────────────────────────────
     @property
@@ -157,8 +159,21 @@ class SeamConfig:
     # ── github ───────────────────────────────────────────────────────────
     @property
     def github_token(self) -> str:
-        # env var takes priority
-        return os.environ.get("GITHUB_TOKEN", "") or self._data.get("github", {}).get("token", "")
+        """
+        Token is read from the GITHUB_TOKEN env var ONLY (matches docs/usage.md).
+        A plaintext token in profile.yaml is a credential-leak risk: it is
+        never used, and we warn once so the user knows to remove it.
+        """
+        profile_token = self._data.get("github", {}).get("token", "")
+        if profile_token and not self._warned_profile_token:
+            self._warned_profile_token = True
+            print(
+                "[seam/config] ⚠ github.token found in profile.yaml — IGNORED. "
+                "Plaintext tokens in the profile are not supported; "
+                "remove it and use the GITHUB_TOKEN env var instead.",
+                file=sys.stderr,
+            )
+        return os.environ.get("GITHUB_TOKEN", "")
 
     @property
     def github(self) -> dict[str, Any]:

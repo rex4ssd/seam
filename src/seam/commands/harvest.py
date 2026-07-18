@@ -32,6 +32,9 @@ def _picks_to_clone_list(picks: list[dict]) -> list[tuple[str, str, int]]:
 @click.option("--stars", default=0, type=int, help="Stars hint for --repo.")
 @click.option("--dry-run", is_flag=True,
               help="Print what would be cloned without touching disk.")
+@click.option("--yes", "auto_update", is_flag=True,
+              help="Allow destructive in-place update (fetch + reset --hard) "
+                   "of already-cloned repos. Default: skip updated repos.")
 @click.option("--pipe-vein", is_flag=True,
               help="Output 'owner/repo --tag ...' lines suitable for vein fetch.")
 @click.option("--json", "as_json", is_flag=True,
@@ -45,6 +48,7 @@ def cmd_harvest(
     language: str,
     stars: int,
     dry_run: bool,
+    auto_update: bool,
     pipe_vein: bool,
     as_json: bool,
     profile_path: str | None,
@@ -101,7 +105,8 @@ def cmd_harvest(
         sys.exit(0)
 
     results = clone_repos_batch(slugs, target_dir, hcfg,
-                                dry_run=False, verbose=verbose)
+                                dry_run=False, verbose=verbose,
+                                auto_update=auto_update)
 
     # ── output ────────────────────────────────────────────────────────────
     for r in results:

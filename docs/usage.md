@@ -85,7 +85,7 @@ picks_per_day: 3
 
 # GitHub 搜尋
 github:
-  token: ""          # 留空 → 60 req/hr；建議 env: export GITHUB_TOKEN=ghp_xxx
+  token: ""          # 已停用：token 只從 env 讀（export GITHUB_TOKEN=ghp_xxx）；此欄位若填值會被警告並忽略
   min_stars: 200     # 硬過濾：少於這個直接丟掉
   max_age_days: 90   # 超過 N 天沒 push 的也丟掉
 

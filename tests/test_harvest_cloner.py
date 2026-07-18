@@ -20,9 +20,14 @@ from seam.core.models import CloneResult
 from seam.harvest.cloner import (
     clone_repo,
     clone_repos_batch,
+    cleanup_stale_temps,
+    write_owner_marker,
     _free_gb,
     _head_commit,
     _remote_head,
+    _temp_dir_is_stale,
+    _worktree_dirty,
+    TEMP_TTL_SEC,
 )
 from seam.harvest.layout import write_meta, read_meta, repo_dir
 
@@ -134,7 +139,8 @@ class TestExistingRepo:
         assert result.skipped
         assert result.skipped_reason == "exists_same_commit"
 
-    def test_update_when_different_commit(self, tmp_path):
+    def test_update_when_different_commit_with_yes(self, tmp_path):
+        """--yes + clean worktree → destructive in-place update allowed."""
         old_commit = "a" * 40
         new_commit = "b" * 40
         self._setup_existing(tmp_path, "owner/repo", old_commit, "Python")
@@ -144,11 +150,52 @@ class TestExistingRepo:
 
         with patch("seam.harvest.cloner._free_gb", return_value=100.0), \
              patch("seam.harvest.cloner._remote_head", return_value=new_commit), \
+             patch("seam.harvest.cloner._worktree_dirty", return_value=False), \
              patch("seam.harvest.cloner._do_fetch_reset", return_value=(True, new_commit)):
-            result = clone_repo("owner/repo", tmp_path, hcfg, language="Python")
+            result = clone_repo("owner/repo", tmp_path, hcfg, language="Python",
+                                auto_update=True)
 
         assert not result.skipped
         assert result.commit == new_commit
+
+    def test_update_skipped_without_yes(self, tmp_path):
+        """Default (no --yes): a new remote commit must NOT trigger reset --hard."""
+        old_commit = "a" * 40
+        new_commit = "b" * 40
+        self._setup_existing(tmp_path, "owner/repo", old_commit, "Python")
+
+        cfg = _make_cfg(tmp_path)
+        hcfg = cfg.harvest
+
+        with patch("seam.harvest.cloner._free_gb", return_value=100.0), \
+             patch("seam.harvest.cloner._remote_head", return_value=new_commit), \
+             patch("seam.harvest.cloner._do_fetch_reset") as mock_reset:
+            result = clone_repo("owner/repo", tmp_path, hcfg, language="Python")
+
+        assert result.skipped
+        assert result.skipped_reason == "update_requires_yes"
+        assert result.commit == old_commit
+        mock_reset.assert_not_called()
+
+    def test_dirty_worktree_refused_even_with_yes(self, tmp_path):
+        """Local modifications → refuse destructive update regardless of --yes."""
+        old_commit = "a" * 40
+        new_commit = "b" * 40
+        self._setup_existing(tmp_path, "owner/repo", old_commit, "Python")
+
+        cfg = _make_cfg(tmp_path)
+        hcfg = cfg.harvest
+
+        with patch("seam.harvest.cloner._free_gb", return_value=100.0), \
+             patch("seam.harvest.cloner._remote_head", return_value=new_commit), \
+             patch("seam.harvest.cloner._worktree_dirty", return_value=True), \
+             patch("seam.harvest.cloner._do_fetch_reset") as mock_reset:
+            result = clone_repo("owner/repo", tmp_path, hcfg, language="Python",
+                                auto_update=True)
+
+        assert result.skipped
+        assert result.skipped_reason == "dirty_worktree"
+        mock_reset.assert_not_called()
 
     def test_skip_conservatively_when_remote_head_unavailable(self, tmp_path):
         commit = "a" * 40
@@ -275,6 +322,118 @@ class TestLanguageMapping:
             result = clone_repo("owner/repo", tmp_path, hcfg, language="Rust")
 
         assert result.language == "rust"
+
+
+# ── unit: owner-aware stale-temp cleanup ─────────────────────────────────────
+
+class TestCleanupOwnership:
+    def _make_temp(self, tmp_path: Path, name: str = "seam_clone_a__b_x1") -> Path:
+        d = tmp_path / "python" / name
+        d.mkdir(parents=True)
+        (d / "somefile").write_text("data")
+        return d
+
+    def test_live_owner_not_removed(self, tmp_path):
+        """Temp dir owned by a live, unexpired run must survive cleanup."""
+        d = self._make_temp(tmp_path)
+        write_owner_marker(d)   # our own (live) PID, fresh timestamp
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 0
+        assert d.exists()
+
+    def test_dead_owner_removed(self, tmp_path):
+        import subprocess as sp
+        proc = sp.Popen(["true"])
+        proc.wait()
+        d = self._make_temp(tmp_path)
+        write_owner_marker(d, pid=proc.pid)
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 1
+        assert not d.exists()
+
+    def test_live_owner_over_ttl_removed(self, tmp_path):
+        """Even a live owner loses its temp dir once the marker TTL expires."""
+        import json as _json
+        d = self._make_temp(tmp_path)
+        marker = write_owner_marker(d)
+        data = _json.loads(marker.read_text())
+        data["created_at"] -= (data["ttl_sec"] + 60)   # push past TTL
+        marker.write_text(_json.dumps(data))
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 1
+        assert not d.exists()
+
+    def test_no_marker_recent_kept(self, tmp_path):
+        """No marker + recent mtime → can't prove abandonment → keep."""
+        d = self._make_temp(tmp_path)
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 0
+        assert d.exists()
+
+    def test_no_marker_old_removed(self, tmp_path):
+        """No marker but dir older than TEMP_TTL_SEC → abandoned → remove."""
+        d = self._make_temp(tmp_path)
+        old = os.path.getmtime(d) - (TEMP_TTL_SEC + 3600)
+        os.utime(d, (old, old))
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 1
+        assert not d.exists()
+
+    def test_non_seam_dirs_untouched(self, tmp_path):
+        d = tmp_path / "python" / "owner__repo"
+        d.mkdir(parents=True)
+        removed = cleanup_stale_temps(tmp_path)
+        assert removed == 0
+        assert d.exists()
+
+    def test_corrupt_marker_falls_back_to_mtime(self, tmp_path):
+        d = self._make_temp(tmp_path)
+        (d / ".seam-clone-owner.json").write_text("{not json")
+        assert _temp_dir_is_stale(d) is False   # recent mtime → keep
+        old = os.path.getmtime(d) - (TEMP_TTL_SEC + 3600)
+        os.utime(d, (old, old))
+        assert _temp_dir_is_stale(d) is True    # old → stale
+
+
+# ── unit: _worktree_dirty (real git repos) ───────────────────────────────────
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+class TestWorktreeDirty:
+    def _make_repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init")
+        _git(repo, "config", "user.email", "t@t")
+        _git(repo, "config", "user.name", "t")
+        (repo / "a.txt").write_text("hello\n")
+        _git(repo, "add", "a.txt")
+        _git(repo, "commit", "-m", "init")
+        return repo
+
+    def test_clean_repo_not_dirty(self, tmp_path):
+        repo = self._make_repo(tmp_path)
+        assert _worktree_dirty(repo, 30) is False
+
+    def test_modified_tracked_file_is_dirty(self, tmp_path):
+        repo = self._make_repo(tmp_path)
+        (repo / "a.txt").write_text("modified\n")
+        assert _worktree_dirty(repo, 30) is True
+
+    def test_untracked_seam_files_not_dirty(self, tmp_path):
+        """.seam-meta.json / STRENGTH.md are untracked — reset keeps them."""
+        repo = self._make_repo(tmp_path)
+        (repo / ".seam-meta.json").write_text("{}")
+        (repo / "STRENGTH.md").write_text("# report")
+        assert _worktree_dirty(repo, 30) is False
+
+    def test_non_git_dir_reports_dirty(self, tmp_path):
+        """Not a repo → cannot verify → err on the safe side."""
+        d = tmp_path / "notrepo"
+        d.mkdir()
+        assert _worktree_dirty(d, 30) is True
 
 
 # ── network tests (skipped by default) ───────────────────────────────────────

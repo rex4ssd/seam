@@ -2,10 +2,13 @@
 Phase 3.5 — runtime/lock.py + runtime/history.py unit tests.
 
 lock:
-  - context manager acquires and releases lock file
-  - stale PID (dead process) → auto-cleared, proceeds
-  - live PID → raises LockError
+  - context manager acquires and releases lock file (atomic O_CREAT|O_EXCL)
+  - stale PID (dead process) → taken over, proceeds
+  - live PID → raises LockError (JSON and legacy plain-PID formats)
   - corrupt lock file → treated as stale
+  - TTL-expired lock (live PID) → taken over
+  - release verifies ownership — never deletes another run's lock
+  - cross-process contention: second process gets LockError
 
 history:
   - mark() appends CSV rows with fsync
@@ -17,14 +20,23 @@ history:
 from __future__ import annotations
 
 import csv
+import json
 import os
+import subprocess
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from seam.runtime.lock import LockError, _pid_alive, single_instance
+from seam.runtime.lock import (
+    DEFAULT_TTL_SEC,
+    LockError,
+    _pid_alive,
+    read_lock_info,
+    single_instance,
+)
 from seam.runtime.history import (
     _TERMINAL,
     load_done_keys,
@@ -44,7 +56,10 @@ class TestLock:
         assert not lock.exists()
         with single_instance(lock):
             assert lock.exists()
-            assert lock.read_text() == str(os.getpid())
+            data = json.loads(lock.read_text())
+            assert data["pid"] == os.getpid()
+            assert data["run_id"]
+            assert data["ttl_sec"] == DEFAULT_TTL_SEC
         assert not lock.exists()
 
     def test_removes_lock_on_exception(self, tmp_path):
@@ -86,6 +101,107 @@ class TestLock:
         lock = tmp_path / "sub" / "dir" / "test.lock"
         with single_instance(lock):
             assert lock.exists()
+
+    def test_live_json_lock_raises(self, tmp_path):
+        """New JSON-format lock with a live PID and fresh TTL → LockError."""
+        lock = tmp_path / "test.lock"
+        lock.write_text(json.dumps({
+            "run_id": "other-run", "pid": os.getpid(),
+            "created_at": time.time(), "ttl_sec": 3600,
+        }))
+        with pytest.raises(LockError):
+            with single_instance(lock):
+                pass
+        assert lock.exists()
+        assert read_lock_info(lock).run_id == "other-run"  # untouched
+
+    def test_ttl_expired_lock_taken_over(self, tmp_path):
+        """Owner PID alive but lock exceeded its own TTL → takeover."""
+        lock = tmp_path / "test.lock"
+        lock.write_text(json.dumps({
+            "run_id": "old-run", "pid": os.getpid(),
+            "created_at": time.time() - 7200, "ttl_sec": 3600,  # 2h old, 1h TTL
+        }))
+        with single_instance(lock):
+            info = read_lock_info(lock)
+            assert info.run_id != "old-run"   # we own it now
+            assert info.pid == os.getpid()
+        assert not lock.exists()
+
+    def test_dead_pid_json_lock_taken_over(self, tmp_path):
+        proc = subprocess.Popen(["true"])
+        proc.wait()
+        lock = tmp_path / "test.lock"
+        lock.write_text(json.dumps({
+            "run_id": "dead-run", "pid": proc.pid,
+            "created_at": time.time(), "ttl_sec": 3600,
+        }))
+        with single_instance(lock):
+            assert read_lock_info(lock).pid == os.getpid()
+        assert not lock.exists()
+
+    def test_release_verifies_owner(self, tmp_path):
+        """If another run replaced the lock mid-run, exit must NOT delete it."""
+        lock = tmp_path / "test.lock"
+        foreign = json.dumps({
+            "run_id": "foreign-run", "pid": os.getpid(),
+            "created_at": time.time(), "ttl_sec": 3600,
+        })
+        with single_instance(lock):
+            lock.write_text(foreign)   # simulate takeover after our TTL expiry
+        assert lock.exists()           # foreign lock survived our release
+        assert read_lock_info(lock).run_id == "foreign-run"
+
+    def test_cross_process_contention(self, tmp_path):
+        """A second real process must fail to acquire while we hold the lock."""
+        lock = tmp_path / "test.lock"
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1])\n"
+            "from seam.runtime.lock import single_instance, LockError\n"
+            "from pathlib import Path\n"
+            "try:\n"
+            "    with single_instance(Path(sys.argv[2])):\n"
+            "        pass\n"
+            "except LockError:\n"
+            "    sys.exit(42)\n"
+            "sys.exit(0)\n"
+        )
+        with single_instance(lock):
+            r = subprocess.run(
+                [sys.executable, "-c", code, str(src_dir), str(lock)],
+                timeout=30,
+            )
+            assert r.returncode == 42   # child saw LockError
+            assert read_lock_info(lock).pid == os.getpid()  # still ours
+        assert not lock.exists()
+
+    def test_concurrent_race_single_winner(self, tmp_path):
+        """N processes race for the same lock — exactly one wins each round."""
+        lock = tmp_path / "race.lock"
+        src_dir = Path(__file__).resolve().parent.parent / "src"
+        code = (
+            "import sys, time; sys.path.insert(0, sys.argv[1])\n"
+            "from seam.runtime.lock import single_instance, LockError\n"
+            "from pathlib import Path\n"
+            "try:\n"
+            "    with single_instance(Path(sys.argv[2])):\n"
+            "        time.sleep(0.5)\n"
+            "except LockError:\n"
+            "    sys.exit(42)\n"
+            "sys.exit(0)\n"
+        )
+        procs = [
+            subprocess.Popen([sys.executable, "-c", code, str(src_dir), str(lock)])
+            for _ in range(4)
+        ]
+        codes = [p.wait(timeout=60) for p in procs]
+        # the 0.5s hold guarantees overlap: at least one loser,
+        # and every process either wins cleanly or gets LockError
+        assert codes.count(0) >= 1
+        assert codes.count(42) >= 1
+        assert all(c in (0, 42) for c in codes)
+        assert not lock.exists()
 
     def test_pid_alive_self(self):
         assert _pid_alive(os.getpid()) is True

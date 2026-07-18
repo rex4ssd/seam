@@ -14,16 +14,20 @@ Design:
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from ..core.config import HarvestCfg
 from ..core.models import CloneResult
+from ..runtime.lock import _pid_alive
 from .layout import (
     ensure_lang_dir,
     repo_dir,
@@ -34,12 +38,70 @@ from .layout import (
 _GH_BASE = "https://github.com"
 _GIT_ENV = {**os.environ, "GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0"}
 
+#: marker file written inside every seam_clone_* temp dir, identifying its owner run.
+_OWNER_MARKER = ".seam-clone-owner.json"
+
+#: a temp dir older than this is considered abandoned even if we can't prove
+#: the owner is dead (e.g. marker missing).
+TEMP_TTL_SEC = 6 * 3600
+
 
 # ── public API ────────────────────────────────────────────────────────────────
 
+def write_owner_marker(tmp_dir: Path, *, run_id: str | None = None,
+                       pid: int | None = None,
+                       ttl_sec: float = TEMP_TTL_SEC) -> Path:
+    """Write the owner marker into a temp clone dir. Returns the marker path."""
+    marker = tmp_dir / _OWNER_MARKER
+    data = {
+        "run_id": run_id or uuid.uuid4().hex,
+        "pid": os.getpid() if pid is None else pid,
+        "created_at": time.time(),
+        "ttl_sec": ttl_sec,
+    }
+    with open(marker, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    return marker
+
+
+def _temp_dir_is_stale(d: Path, now: float | None = None) -> bool:
+    """
+    A seam_clone_* temp dir is stale (safe to delete) only when we can tell
+    its owning run is dead:
+      - marker present: owner PID no longer alive, or older than its TTL
+      - marker missing/corrupt: fall back to dir mtime older than TEMP_TTL_SEC
+    A dir owned by a live, unexpired run is NOT stale.
+    """
+    now = time.time() if now is None else now
+    marker = d / _OWNER_MARKER
+    try:
+        with open(marker, encoding="utf-8") as f:
+            data = json.load(f)
+        pid = int(data.get("pid", 0))
+        created = float(data.get("created_at", 0.0))
+        ttl = float(data.get("ttl_sec", TEMP_TTL_SEC))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        # no/corrupt marker → only age can prove abandonment
+        try:
+            return (now - d.stat().st_mtime) > TEMP_TTL_SEC
+        except OSError:
+            return False
+
+    if pid > 0 and _pid_alive(pid):
+        # owner alive — stale only if it exceeded its own TTL
+        return ttl > 0 and (now - created) > ttl
+    return True   # owner PID dead → crashed run
+
+
 def cleanup_stale_temps(target_root: Path) -> int:
     """
-    Delete leftover seam_clone_* temp dirs from crashed runs.
+    Delete leftover seam_clone_* temp dirs — but ONLY those whose owning run
+    is provably dead (PID gone) or has exceeded its TTL. Temp dirs belonging
+    to a live concurrent run are left alone.
+
+    Must be called while holding the single-instance lock.
     Returns the number of dirs removed.
     """
     removed = 0
@@ -47,10 +109,13 @@ def cleanup_stale_temps(target_root: Path) -> int:
         if not lang_dir.is_dir():
             continue
         for d in lang_dir.iterdir():
-            if d.is_dir() and d.name.startswith("seam_clone_"):
-                shutil.rmtree(d, ignore_errors=True)
-                _warn("cleanup", f"removed stale temp dir: {d}")
-                removed += 1
+            if not (d.is_dir() and d.name.startswith("seam_clone_")):
+                continue
+            if not _temp_dir_is_stale(d):
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            _warn("cleanup", f"removed stale temp dir: {d}")
+            removed += 1
     return removed
 
 
@@ -63,7 +128,7 @@ def clone_repo(
     stars: int = 0,
     dry_run: bool = False,
     verbose: bool = False,
-    auto_update: bool = True,   # False = prompt before overwriting existing repo
+    auto_update: bool = False,   # True (--yes) = allow destructive in-place update
 ) -> CloneResult:
     """
     Clone (or update) owner/repo into target_root/<lang>/<owner>__<repo>/.
@@ -102,12 +167,19 @@ def clone_repo(
     ensure_lang_dir(target_root, lang_folder)
     tmp_dir = Path(tempfile.mkdtemp(prefix=f"seam_clone_{slug.replace('/', '__')}_",
                                     dir=target_root / lang_folder))
+    write_owner_marker(tmp_dir)   # identify this run for owner-aware cleanup
     try:
         ok, commit, size_kb = _do_clone(slug, clone_url, tmp_dir, cfg, verbose)
         if not ok:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return CloneResult(slug=slug, clone_path="", commit="",
                                language=lang_folder, skipped=True, skipped_reason="clone_failed")
+
+        # drop the owner marker before publishing to the final path
+        try:
+            (tmp_dir / _OWNER_MARKER).unlink()
+        except OSError:
+            pass
 
         # atomic rename: tmp → final (P-H01 — no half-baked dir at final path)
         tmp_dir.rename(final_dir)
@@ -130,7 +202,7 @@ def clone_repos_batch(
     *,
     dry_run: bool = False,
     verbose: bool = False,
-    auto_update: bool = True,
+    auto_update: bool = False,
 ) -> list[CloneResult]:
     """
     Clone up to cfg.max_repos_per_night repos, stopping early if disk is low.
@@ -164,9 +236,14 @@ def _handle_existing(
     stars: int,
     dry_run: bool,
     verbose: bool,
-    auto_update: bool = True,
+    auto_update: bool = False,
 ) -> CloneResult:
-    """Repo dir exists: check remote HEAD; skip if same, fetch+reset if different."""
+    """
+    Repo dir exists: check remote HEAD; skip if same.
+    A new remote commit means a destructive in-place update (fetch + reset
+    --hard) — that only happens when auto_update=True (--yes). Default: skip.
+    A dirty worktree is always refused, even with --yes.
+    """
     meta = read_meta(final_dir)
     stored_commit = meta.get("commit", "") if meta else ""
 
@@ -190,20 +267,20 @@ def _handle_existing(
         return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
                            language=lang_folder, skipped=True, skipped_reason="dry_run")
 
-    # ── new commit detected — ask or auto ────────────────────────────────
+    # ── new commit detected — destructive update requires --yes ──────────
     _info(slug, f"new commit detected: {stored_commit[:8]} → {remote_commit[:8]}")
     if not auto_update:
-        if sys.stdin.isatty():
-            ans = input(f"  overwrite {slug}? [y/N] ").strip().lower()
-            if ans != "y":
-                _info(slug, "skipped by user")
-                return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
-                                   language=lang_folder, skipped=True, skipped_reason="user_skip")
-        else:
-            # non-interactive (schedule) — skip and log
-            _warn(slug, "non-interactive: skipping update (use --yes to auto-update)")
-            return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
-                               language=lang_folder, skipped=True, skipped_reason="non_interactive_skip")
+        _warn(slug, "skipping in-place update (destructive; re-run with --yes to allow)")
+        return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
+                           language=lang_folder, skipped=True,
+                           skipped_reason="update_requires_yes")
+
+    # dirty worktree → always refuse (would destroy local modifications)
+    if _worktree_dirty(final_dir, cfg.clone_timeout_sec):
+        _warn(slug, "worktree has local changes — refusing destructive update")
+        return CloneResult(slug=slug, clone_path=str(final_dir), commit=stored_commit,
+                           language=lang_folder, skipped=True,
+                           skipped_reason="dirty_worktree")
 
     # fetch + reset (P-H03)
     ok, new_commit = _do_fetch_reset(slug, final_dir, cfg, verbose)
@@ -296,6 +373,26 @@ def _remote_head(url: str, timeout: int) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+def _worktree_dirty(repo: Path, timeout: int) -> bool:
+    """
+    True if the worktree has local modifications to tracked files
+    (those are what `git reset --hard` would destroy). Untracked files
+    like .seam-meta.json / STRENGTH.md are ignored — reset keeps them.
+    On any error, err on the safe side and report dirty.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo, capture_output=True, text=True,
+            timeout=min(timeout, 30), env=_GIT_ENV,
+        )
+        if r.returncode != 0:
+            return True
+        return bool(r.stdout.strip())
+    except Exception:
+        return True
 
 
 def _head_commit(repo: Path) -> str:

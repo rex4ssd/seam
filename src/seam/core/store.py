@@ -7,6 +7,28 @@ from pathlib import Path
 from .models import Pick
 
 
+def atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    """
+    Crash-safe file write: temp file in the same directory + fsync +
+    os.replace (atomic on POSIX). Readers never observe a partial file,
+    and a crash mid-write leaves the previous version intact.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 def _seam_dir(profile_dir: Path | None = None) -> Path:
     if profile_dir:
         return profile_dir

@@ -121,19 +121,20 @@ def main(argv: list[str] | None = None) -> int:
 
     index_path = harvest_index_path(target_dir)
 
-    # ── clean up stale temp dirs from previous crashed runs ───────────────
-    if not dry_run:
-        removed = cloner.cleanup_stale_temps(target_dir)
-        if removed:
-            log.info("cleaned up %d stale temp dir(s)", removed)
-
-    # ── --self-check path ─────────────────────────────────────────────────
-    if self_check:
-        return _run_self_check(cfg, target_dir, index_path, dry_run)
-
-    # ── normal run (single-instance lock) ─────────────────────────────────
+    # ── run under the single-instance lock ────────────────────────────────
+    # Stale-temp cleanup happens ONLY after the lock is held, and only
+    # removes temp dirs whose owning run is provably dead (owner marker:
+    # PID gone or TTL exceeded) — never a live concurrent run's clones.
     try:
         with single_instance():
+            if not dry_run:
+                removed = cloner.cleanup_stale_temps(target_dir)
+                if removed:
+                    log.info("cleaned up %d stale temp dir(s)", removed)
+
+            if self_check:
+                return _run_self_check(cfg, target_dir, index_path, dry_run)
+
             return _run_once(cfg, harvest_cfg, target_dir, index_path, dry_run,
                              from_picks=from_picks, auto_update=auto_update)
     except LockError as exc:
@@ -143,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_once(cfg, harvest_cfg, target_dir: Path, index_path: Path,
               dry_run: bool, from_picks: bool = False,
-              auto_update: bool = True) -> int:
+              auto_update: bool = False) -> int:
     """One full harvest cycle."""
     finalized, in_progress = load_done_keys(_HIST)
     sf = now_slot()
